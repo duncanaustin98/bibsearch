@@ -28,6 +28,8 @@ dependencies = [
 # ADS is only used as a supplementary title/author enrichment layer and
 # needs an API token in ADS_DEV_KEY. The tool works fully without it.
 ads = ["ads"]
+# tqdm gives nicer progress bars; without it a plain stderr counter is used.
+progress = ["tqdm"]
 
 [project.scripts]
 bibsearch = "bibsearch:main"
