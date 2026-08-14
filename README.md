@@ -3,18 +3,21 @@
 Check whether one or more sky positions have already appeared in the astrophysics
 literature.
 
-Given RA/Dec, `bibsearch` cone-searches **SIMBAD** and **NED** for catalogued objects
-at that position and returns the bibliography attached to each match. With `--vizier`
-it also searches **all of VizieR**, which reaches papers whose sources were never
-folded into SIMBAD or NED. Optionally it first confirms archival coverage through
-**MAST** for a given mission, and — if an ADS token is available — fills in missing
-paper titles and authors from **ADS**.
+Given RA/Dec, `bibsearch` searches **SIMBAD**, **NED** and **VizieR** for anything
+published at that position and returns the combined bibliography. SIMBAD and NED are
+object-centric and curated, so they lag and miss things; VizieR indexes published
+tables directly and reaches papers the other two never catalogued. Optionally it first
+confirms archival coverage through **MAST** for a given mission, and — if an ADS token
+is available — fills in missing paper titles and authors from **ADS**.
+
+All four services run by default. Passing any of `--simbad`, `--ned`, `--vizier`,
+`--ads` restricts the search to exactly those.
 
 Every bibcode is tagged with the service that found it, so you can see which source
 contributed what:
 
 ```
-RA=53.153980  Dec=-27.800950  (radius=2.0")
+RA=53.153980  Dec=-27.800950  (radius=2.0", services: SIMBAD+NED+VizieR+ADS)
   Resolved name(s): CANDELS J033236.88-274803.7, UDF  2878, ...
   Papers found: 64  [SIMBAD: 11, NED: 25, VizieR: 52]
     2026  [V   ]  2026A&A...709A.205S  Transition from outside-in to inside-out at z~2  Song J.
@@ -69,7 +72,10 @@ bibsearch --radec 53.15398,-27.80095 --mission HST
 # Skip the archive-coverage check entirely
 bibsearch --radec 53.15398,-27.80095 --mission ""
 
-# Add the VizieR search (slower, but substantially better recall)
+# Restrict to specific services: skip the slow VizieR pass
+bibsearch --radec 53.15398,-27.80095 --simbad --ned
+
+# VizieR only
 bibsearch --radec 53.15398,-27.80095 --vizier
 
 # Many positions from a file
@@ -92,10 +98,27 @@ Blank lines and lines starting with `#` are ignored:
 | `--radec` | *(required)* | `ra,dec` in degrees, or a path to a file of pairs |
 | `--radius` | `2.0` | Cone-search radius in arcsec |
 | `--mission` | `JWST` | MAST `obs_collection` to check; `""` disables |
-| `--vizier` | off | Also search all of VizieR (see below) |
+| `--simbad` `--ned` `--vizier` `--ads` | all on | Restrict to the named services (see below) |
 | `--workers` | `8` | Threads for NED reference and VizieR metadata lookups |
 | `--no-progress` | off | Suppress progress bars |
 | `--savefile` | *(none)* | Write the report to this path as well as stdout |
+
+### Choosing services
+
+With no service flag, all four are used. Any flag you pass becomes the whole set:
+
+| Invocation | Services used |
+| --- | --- |
+| `bibsearch --radec …` | SIMBAD + NED + VizieR + ADS |
+| `bibsearch --radec … --simbad --ned` | SIMBAD + NED — skips the slow VizieR pass |
+| `bibsearch --radec … --vizier` | VizieR only |
+
+The header line of each report records which services ran, so saved output stays
+self-documenting.
+
+`--ads` is a special case: ADS is searched by resolved object *name*, and only SIMBAD
+and NED resolve names. `--ads` on its own therefore finds nothing, and says so rather
+than reporting a bare zero.
 
 Progress bars are written to **stderr** and appear only when stderr is a terminal, so
 piping or `--savefile` output stays clean.
@@ -103,12 +126,13 @@ piping or `--savefile` output stays clean.
 ### The VizieR search
 
 VizieR indexes published tables directly, far more comprehensively than those sources
-become SIMBAD or NED objects, so `--vizier` is the single biggest improvement to
-recall. On a test position in the HUDF it took the paper count from 31 to 64.
+become SIMBAD or NED objects, so it dominates recall. On a test position in the HUDF it
+takes the paper count from 31 to 64 — roughly half the results come from VizieR alone.
 
-It is off by default because it costs roughly 20–60s per position: the all-VizieR cone
+It is also the slowest step, costing roughly 20–60s per position: the all-VizieR cone
 search is a single slow call, and each matching catalogue then needs a metadata lookup
-to recover its bibcode. Those lookups are threaded (`--workers`).
+to recover its bibcode. Those lookups are threaded (`--workers`). If you need a quick
+answer, `--simbad --ned` skips it.
 
 Some VizieR archive catalogues (`B/eso`, `B/hst`) return free text such as
 `"European Southern Observatory (2016)"` in place of a bibcode; these are observation

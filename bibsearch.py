@@ -3,13 +3,15 @@
 Check whether sky position(s) have appeared in the astrophysics literature.
 
 Workflow: optionally confirm archival coverage via MAST for a given mission,
-then pull the bibliography directly from SIMBAD (biblio field) and NED
-(references table) for any catalogued object at that position. VizieR can be
-added with --vizier: CDS ingests published tables far more comprehensively than
-they become SIMBAD/NED objects, so it reaches papers the other two miss, at the
-cost of roughly a minute per position. ADS is used only as an optional
-supplement/title-enrichment layer when a key is set -- searching ADS by object
-name alone is unreliable, so it is not the primary source.
+then pull the bibliography for that position from SIMBAD (biblio field), NED
+(references table) and VizieR (catalogue metadata). SIMBAD and NED are
+object-centric and curated, so they lag and miss things; VizieR indexes
+published tables directly and reaches papers the other two never catalogued.
+ADS is a supplement/title-enrichment layer that needs a key -- searching ADS by
+object name alone is unreliable, so it is not a primary source.
+
+All four run by default. Passing any of --simbad/--ned/--vizier/--ads restricts
+the search to exactly those services.
 
 Every bibcode in the report is tagged with the service(s) that found it:
 [S]IMBAD, [N]ED, [V]izieR, [A]DS.
@@ -23,7 +25,8 @@ Usage:
     bibsearch --radec coords.txt
     bibsearch --radec 53.15398,-27.80095 --radius 3 --savefile out.txt
     bibsearch --radec 53.15398,-27.80095 --mission HST
-    bibsearch --radec 53.15398,-27.80095 --vizier
+    bibsearch --radec 53.15398,-27.80095 --simbad --ned    # skip the slow VizieR pass
+    bibsearch --radec 53.15398,-27.80095 --vizier          # VizieR only
 
 coords.txt format (two comma-separated columns, RA,Dec in degrees, one pair per line):
     53.15398,-27.80095
@@ -72,6 +75,12 @@ BIBCODE_RE = re.compile(r"^\d{4}\S{15}$")
 
 # Order in which provenance tags are displayed.
 _TAG_ORDER = "SNVA"
+
+# Bibliography services, in display order. All are used unless the caller
+# selects a subset on the command line.
+SERVICE_ORDER = ("simbad", "ned", "vizier", "ads")
+SERVICE_LABELS = {"simbad": "SIMBAD", "ned": "NED", "vizier": "VizieR", "ads": "ADS"}
+DEFAULT_SERVICES = frozenset(SERVICE_ORDER)
 
 
 def _fmt_exc(exc):
@@ -259,12 +268,18 @@ def check_object_in_literature(
     dec_deg,
     radius_arcsec,
     mission,
-    use_vizier=False,
+    services=None,
     workers=8,
     show_progress=False,
 ):
-    """Return a formatted report string for one RA/Dec pair."""
-    lines = [f"RA={ra_deg:.6f}  Dec={dec_deg:.6f}  (radius={radius_arcsec}\")"]
+    """Return a formatted report string for one RA/Dec pair.
+
+    `services` is the set of bibliography services to query; it defaults to all
+    of them (see DEFAULT_SERVICES).
+    """
+    services = DEFAULT_SERVICES if services is None else frozenset(services)
+    used = "+".join(SERVICE_LABELS[s] for s in SERVICE_ORDER if s in services) or "none"
+    lines = [f"RA={ra_deg:.6f}  Dec={dec_deg:.6f}  (radius={radius_arcsec}\", services: {used})"]
 
     coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
     errors = []
@@ -283,14 +298,18 @@ def check_object_in_literature(
             mission_line += f"  (target: {', '.join(sorted(target_names))})"
         lines.append(mission_line)
 
-    simbad_hits, simbad_errors = simbad_lookup(coord, radius_arcsec)
-    errors += simbad_errors
+    simbad_hits = {}
+    if "simbad" in services:
+        simbad_hits, simbad_errors = simbad_lookup(coord, radius_arcsec)
+        errors += simbad_errors
 
-    ned_hits, ned_errors = ned_lookup(coord, radius_arcsec, workers, show_progress)
-    errors += ned_errors
+    ned_hits = {}
+    if "ned" in services:
+        ned_hits, ned_errors = ned_lookup(coord, radius_arcsec, workers, show_progress)
+        errors += ned_errors
 
-    vizier_papers, vizier_errors = ({}, [])
-    if use_vizier:
+    vizier_papers = {}
+    if "vizier" in services:
         vizier_papers, vizier_errors = vizier_lookup(coord, radius_arcsec, workers, show_progress)
         errors += vizier_errors
 
@@ -322,16 +341,24 @@ def check_object_in_literature(
     for bc, (title, author) in vizier_papers.items():
         merge(bc, title=title, author=author, source="V")
 
-    for name in set(simbad_hits) | set(ned_hits):
-        for p in find_papers_for_object(name):
-            title = p.title[0] if p.title else None
-            author = p.author[0] if p.author else None
-            merge(p.bibcode, title=title, author=author, source="A")
+    if "ads" in services:
+        # ADS is searched by resolved object name, so it can only contribute when
+        # SIMBAD or NED supplied names. Say so rather than returning a silent zero.
+        if not (services & {"simbad", "ned"}):
+            lines.append(
+                "  Note: ADS is searched by object name, which only SIMBAD and NED "
+                "resolve -- select one of them for ADS to contribute."
+            )
+        for name in set(simbad_hits) | set(ned_hits):
+            for p in find_papers_for_object(name):
+                title = p.title[0] if p.title else None
+                author = p.author[0] if p.author else None
+                merge(p.bibcode, title=title, author=author, source="A")
 
-    missing = [bc for bc, v in papers.items() if not v["title"] or not v["author"]]
-    if missing:
-        for bc, (title, author) in enrich_metadata(missing).items():
-            merge(bc, title=title, author=author)
+        missing = [bc for bc, v in papers.items() if not v["title"] or not v["author"]]
+        if missing:
+            for bc, (title, author) in enrich_metadata(missing).items():
+                merge(bc, title=title, author=author)
 
     counts = {tag: sum(1 for v in papers.values() if tag in v["sources"]) for tag in _TAG_ORDER}
     breakdown = ", ".join(
@@ -403,11 +430,28 @@ def main():
         help="MAST obs_collection to check for archival coverage (e.g. JWST, HST, TESS). "
         "Pass an empty string to skip the coverage check. (default: JWST)",
     )
-    parser.add_argument(
+    services = parser.add_argument_group(
+        "service selection",
+        "By default SIMBAD, NED, VizieR and ADS are all used. Passing any of these "
+        "flags restricts the search to exactly the ones given.",
+    )
+    services.add_argument(
+        "--simbad", action="store_true", help="Query SIMBAD (object bibliographies)."
+    )
+    services.add_argument(
+        "--ned", action="store_true", help="Query NED (extragalactic object references)."
+    )
+    services.add_argument(
         "--vizier",
         action="store_true",
-        help="Also search all of VizieR. Finds papers SIMBAD/NED never catalogued, "
-        "but adds roughly a minute per position.",
+        help="Query VizieR (published catalogue tables). Much the best recall, but "
+        "the slowest step -- roughly 20-60s per position.",
+    )
+    services.add_argument(
+        "--ads",
+        action="store_true",
+        help="Query ADS by resolved object name and fill in missing titles/authors. "
+        "Needs ADS_DEV_KEY and depends on SIMBAD or NED for name resolution.",
     )
     parser.add_argument(
         "--workers",
@@ -431,6 +475,10 @@ def main():
     coords = parse_coord_list(args.radec)
     show_progress = not args.no_progress and sys.stderr.isatty()
 
+    selected = frozenset(s for s in SERVICE_ORDER if getattr(args, s))
+    if not selected:
+        selected = DEFAULT_SERVICES
+
     reports = []
     for i, (ra, dec) in enumerate(coords, 1):
         if show_progress and len(coords) > 1:
@@ -441,7 +489,7 @@ def main():
                 dec,
                 args.radius,
                 args.mission,
-                use_vizier=args.vizier,
+                services=selected,
                 workers=args.workers,
                 show_progress=show_progress,
             )
