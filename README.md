@@ -32,10 +32,13 @@ RA=189.106043  Dec=62.242045  (radius=0.5", services: SIMBAD+NED+VizieR+ADS)
 Install into whichever conda environment or virtualenv you want to run it from:
 
 ```bash
-git clone https://github.com/<your-username>/bibsearch.git
+git clone https://github.com/vadimrusakov/bibsearch
 cd bibsearch
-pip install .
+pip install ".[ads]"
 ```
+
+Use the bare `pip install .` only if you have no ADS token — see below for why it
+matters.
 
 For an editable install while developing:
 
@@ -50,9 +53,15 @@ pip install ".[ads]"
 export ADS_DEV_KEY="your-ads-api-token"   # https://ui.adsabs.harvard.edu/user/settings/token
 ```
 
-ADS is a supplement only — it fills in titles and authors that NED did not supply.
-The tool is fully functional without it. Note that ADS's `object:` search is itself
-built on SIMBAD/NED name resolution, so it does not extend catalogue coverage.
+ADS does not extend catalogue coverage — its `object:` search is itself built on
+SIMBAD/NED name resolution — but it is what supplies **titles and authors for bibcodes
+that only SIMBAD found**. SIMBAD's `biblio` field returns bare bibcodes, and SIMBAD is
+usually the largest contributor, so without ADS much of the report reads
+`(title unavailable)  (author unavailable)`. NED and VizieR supply their own metadata
+and are unaffected.
+
+ADS needs both the `ads` package and `ADS_DEV_KEY`. If either is missing it is dropped
+from the search rather than silently doing nothing, and `--ads` warns.
 
 ## Usage
 

@@ -476,8 +476,27 @@ def main():
     show_progress = not args.no_progress and sys.stderr.isatty()
 
     selected = frozenset(s for s in SERVICE_ORDER if getattr(args, s))
+    explicit = bool(selected)
     if not selected:
         selected = DEFAULT_SERVICES
+
+    # ADS needs both the package and a token. Drop it when either is missing so the
+    # report never claims a service it could not use, and say why if it was asked for.
+    if "ads" in selected:
+        if ads is None:
+            reason = 'the "ads" package is not installed (pip install ".[ads]")'
+        elif not os.environ.get("ADS_DEV_KEY"):
+            reason = "ADS_DEV_KEY is not set"
+        else:
+            reason = None
+        if reason:
+            selected -= {"ads"}
+            if explicit:
+                print(f"warning: ADS unavailable -- {reason}.", file=sys.stderr)
+                print(
+                    "         Bibcodes found only by SIMBAD will have no title or author.",
+                    file=sys.stderr,
+                )
 
     reports = []
     for i, (ra, dec) in enumerate(coords, 1):
