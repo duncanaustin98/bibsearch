@@ -61,7 +61,7 @@ usually the largest contributor, so without ADS much of the report reads
 and are unaffected.
 
 ADS needs both the `ads` package and `ADS_DEV_KEY`. If either is missing it is dropped
-from the search rather than silently doing nothing, and `--ads` warns.
+from the search, and `--ads` warns.
 
 ## Usage
 
