@@ -1,31 +1,31 @@
 # bibsearch
 
 Check whether one or more sky positions have already appeared in the astrophysics
-literature.
+literature. Give it a single RA/Dec or a file of coordinates and it searches **SIMBAD**,
+**NED** and **VizieR** for anything published there, returning the combined bibliography
+with every bibcode tagged by the service that found it — `[S]`IMBAD, `[N]`ED,
+`[V]`izieR, `[A]`DS.
 
-Given RA/Dec, `bibsearch` searches **SIMBAD**, **NED** and **VizieR** for anything
-published at that position and returns the combined bibliography. SIMBAD and NED are
-object-centric and curated, so they lag and miss things; VizieR indexes published
-tables directly and reaches papers the other two never catalogued. Optionally it first
-confirms archival coverage through **MAST** for a given mission, and — if an ADS token
-is available — fills in missing paper titles and authors from **ADS**.
+SIMBAD and NED are curated object databases, so they lag and miss things; VizieR indexes
+published tables directly and reaches papers the other two never catalogued. All three
+run by default, and `--simbad`, `--ned` or `--vizier` restricts the search to exactly
+those. It can also check archival coverage via **MAST**, and fill in missing titles and
+authors from **ADS** when a token is set.
 
-All four services run by default. Passing any of `--simbad`, `--ned`, `--vizier`,
-`--ads` restricts the search to exactly those.
+**A hit is strong evidence; a miss is weak evidence.** These are curated databases, not
+a complete index of the literature, so never read an empty result as proof that a source
+is unpublished.
 
-Every bibcode is tagged with the service that found it, so you can see which source
-contributed what:
 
 ```
-RA=53.153980  Dec=-27.800950  (radius=2.0", services: SIMBAD+NED+VizieR+ADS)
-  Resolved name(s): CANDELS J033236.88-274803.7, UDF  2878, ...
-  Papers found: 64  [SIMBAD: 11, NED: 25, VizieR: 52]
-    2026  [V   ]  2026A&A...709A.205S  Transition from outside-in to inside-out at z~2  Song J.
-    2025  [S   ]  2025A&A...697A.175S  JADES: A large population of obscured, ...  Scholtz, Jan
-    2018  [SN  ]  2018ApJ...854...29M  The Number Density Evolution of Extreme ...  Maseda, Michael V.
+RA=189.106043  Dec=62.242045  (radius=0.5", services: SIMBAD+NED+VizieR+ADS)
+  JWST observations: 203  (target: GN-z11, GNZ11, GNZ7Q, GNz11, ...)
+  Resolved name(s): GN-z11, GNZ11, GNz11, ...
+  Papers found: 331  [SIMBAD: 285, NED: 109, VizieR: 20]
+    ...
+    2016  [SN  ]  2016ApJ...819..129O  A Remarkably Luminous Galaxy at z=11.1 Measured with Hubble Space Telescope Grism Spectroscopy  Oesch, P. A.
+    ...
 ```
-
-`[S]`IMBAD, `[N]`ED, `[V]`izieR, `[A]`DS.
 
 ## Installation
 
@@ -36,9 +36,6 @@ git clone https://github.com/<your-username>/bibsearch.git
 cd bibsearch
 pip install .
 ```
-
-This puts a `bibsearch` launcher in that environment's `bin/`, wired to that
-environment's interpreter. Activate the environment and the command is on your `PATH`.
 
 For an editable install while developing:
 
@@ -61,22 +58,22 @@ built on SIMBAD/NED name resolution, so it does not extend catalogue coverage.
 
 ```bash
 # Single position (RA, Dec in degrees)
-bibsearch --radec 53.15398,-27.80095
+bibsearch --radec 189.106043,62.242045
 
 # Larger search radius, save the report
-bibsearch --radec 53.15398,-27.80095 --radius 3 --savefile out.txt
+bibsearch --radec 189.106043,62.242045 --radius 3 --savefile out.txt
 
 # Check HST archival coverage instead of the JWST default
-bibsearch --radec 53.15398,-27.80095 --mission HST
+bibsearch --radec 189.106043,62.242045 --mission HST
 
 # Skip the archive-coverage check entirely
-bibsearch --radec 53.15398,-27.80095 --mission ""
+bibsearch --radec 189.106043,62.242045 --mission ""
 
 # Restrict to specific services: skip the slow VizieR pass
-bibsearch --radec 53.15398,-27.80095 --simbad --ned
+bibsearch --radec 189.106043,62.242045 --simbad --ned
 
 # VizieR only
-bibsearch --radec 53.15398,-27.80095 --vizier
+bibsearch --radec 189.106043,62.242045 --vizier
 
 # Many positions from a file
 bibsearch --radec coords.txt
@@ -86,57 +83,26 @@ bibsearch --radec coords.txt
 Blank lines and lines starting with `#` are ignored:
 
 ```
-# GOODS-S
-53.15398,-27.80095
-53.16,-27.81
+# GOODS-N
+189.106043,62.242045
+189.106043,62.242045
 ```
 
-### Options
+### Command line arguments
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--radec` | *(required)* | `ra,dec` in degrees, or a path to a file of pairs |
 | `--radius` | `2.0` | Cone-search radius in arcsec |
 | `--mission` | `JWST` | MAST `obs_collection` to check; `""` disables |
-| `--simbad` `--ned` `--vizier` `--ads` | all on | Restrict to the named services (see below) |
+| `--simbad` `--ned` `--vizier` | all on | Restrict to the named services (see below) |
 | `--workers` | `8` | Threads for NED reference and VizieR metadata lookups |
 | `--no-progress` | off | Suppress progress bars |
 | `--savefile` | *(none)* | Write the report to this path as well as stdout |
 
-### Choosing services
-
-With no service flag, all four are used. Any flag you pass becomes the whole set:
-
-| Invocation | Services used |
-| --- | --- |
-| `bibsearch --radec …` | SIMBAD + NED + VizieR + ADS |
-| `bibsearch --radec … --simbad --ned` | SIMBAD + NED — skips the slow VizieR pass |
-| `bibsearch --radec … --vizier` | VizieR only |
-
-The header line of each report records which services ran, so saved output stays
-self-documenting.
-
-`--ads` is a special case: ADS is searched by resolved object *name*, and only SIMBAD
-and NED resolve names. `--ads` on its own therefore finds nothing, and says so rather
-than reporting a bare zero.
-
-Progress bars are written to **stderr** and appear only when stderr is a terminal, so
-piping or `--savefile` output stays clean.
-
-### The VizieR search
-
-VizieR indexes published tables directly, far more comprehensively than those sources
-become SIMBAD or NED objects, so it dominates recall. On a test position in the HUDF it
-takes the paper count from 31 to 64 — roughly half the results come from VizieR alone.
-
-It is also the slowest step, costing roughly 20–60s per position: the all-VizieR cone
-search is a single slow call, and each matching catalogue then needs a metadata lookup
-to recover its bibcode. Those lookups are threaded (`--workers`). If you need a quick
-answer, `--simbad --ned` skips it.
 
 Some VizieR archive catalogues (`B/eso`, `B/hst`) return free text such as
-`"European Southern Observatory (2016)"` in place of a bibcode; these are observation
-logs rather than papers and are filtered out.
+`"European Southern Observatory (2016)"` in place of a bibcode; these are observation logs rather than papers and are filtered out.
 
 ### Failed queries are reported, never silent
 
@@ -149,44 +115,6 @@ If any service errors, the affected position is flagged and the failures are lis
        VizieR cone search: ConnectionError: VizieR TAP timed out
        NED references for UDF:[CBS2006] 02858: TimeoutError: read timed out
 ```
-
-This matters because the tool's main use is trusting a *negative* result. A timeout
-that silently returned zero papers would be indistinguishable from a genuine absence.
-Note that NED signals "this object has no references" with an error response, which is
-treated as a normal empty result rather than a failure.
-
-## Limitations
-
-**A hit is strong evidence; a miss is weak evidence.** SIMBAD and NED are curated
-databases, not a complete index of the literature. Do not treat an empty result as
-proof that a source is unpublished. In particular:
-
-- **Curation is selective and lags.** Both databases are compiled by human curators
-  from a defined journal list. Recent papers can take months to years to be ingested
-  and linked to objects, so newly reported sources are exactly the ones most likely to
-  be missed. Proceedings, theses and preprints are largely outside the ingest stream.
-- **Object linkage is not paper presence.** A paper can be in SIMBAD's bibliographic
-  database yet not linked to a given object if no curator tagged it — for instance
-  when the source sits in a large table that was never ingested.
-- **Whole classes of object are absent.** Solar system bodies, transients without a
-  permanent designation, gravitational-wave and neutrino events are covered by other
-  services (MPC, TNS, GraceDB). SIMBAD is weighted towards Galactic objects, NED
-  towards extragalactic ones.
-- **Positional matching is imperfect.** The 2″ default is a compromise. Older
-  catalogues carry large astrometric errors (IRAS positions can be off by an
-  arcminute), high-proper-motion stars drift away from their catalogued epoch, and
-  extended objects are stored as a single centroid. Conversely, in crowded or deep
-  fields a match may belong to a neighbouring source rather than yours.
-
-`--vizier` addresses the first of these directly. Beyond it, broader recall would need
-an ADS full-text search on the coordinate-derived source name (many sources are named
-from their coordinates, e.g. `J033236.9-274803`, and full-text search is independent of
-any curation), and TNS for transients.
-
-One remaining gap: the optional ADS calls still fail silently, because "no
-`ADS_DEV_KEY` set" is a normal state and would otherwise produce a warning on every
-run. ADS only supplements titles and authors, so this does not affect which papers are
-found — but unlike the other services, an ADS outage will not be reported.
 
 ## Requirements
 
