@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bibsearch"
+version = "0.1.0"
+description = "Check whether sky positions have appeared in the astrophysics literature, via SIMBAD and NED."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "V. Rusakov" }]
+keywords = ["astronomy", "bibliography", "SIMBAD", "NED", "ADS", "cross-match"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Intended Audience :: Science/Research",
+]
+
+dependencies = [
+    "astropy",
+    # 0.4.10+ is what this has been tested against; the TAP-based Simbad
+    # interface and lower-case column names (main_id, biblio) are required.
+    "astroquery>=0.4.10",
+]
+
+[project.optional-dependencies]
+# ADS is only used as a supplementary title/author enrichment layer and
+# needs an API token in ADS_DEV_KEY. The tool works fully without it.
+ads = ["ads"]
+
+[project.scripts]
+bibsearch = "bibsearch:main"
+
+[tool.setuptools]
+py-modules = ["bibsearch"]
