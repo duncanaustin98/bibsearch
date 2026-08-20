@@ -38,6 +38,7 @@ import html
 import os
 import re
 import sys
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -66,7 +67,35 @@ try:
 except ImportError:
     tqdm = None
 
+NED_CACHE_LOCATION = "/nvme/scratch/work/austind/.astroquery_cache/Ned"
+VIZIER_CACHE_LOCATION = "/nvme/scratch/work/austind/.astroquery_cache/Vizier"
+
+# Ned is used as a persistent singleton everywhere below, so setting these once
+# here is enough. Vizier is not: vizier_lookup() calls Vizier(...), which builds
+# a *new* VizierClass instance via __call__ each time, resetting cache_location
+# (and TIMEOUT) to their class defaults -- ~/.astropy/cache, on a filesystem
+# where the home quota is often exhausted. So VIZIER_CACHE_LOCATION is applied
+# to each fresh instance explicitly in vizier_lookup() instead of here.
+Ned.cache_location = NED_CACHE_LOCATION
+Ned.TIMEOUT = 180
+
 Simbad.add_votable_fields("biblio")
+
+# Region queries hit external services that occasionally time out or drop the
+# connection transiently; retry a couple of times before giving up.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECS = 5
+
+
+def _retry(fn, attempts=RETRY_ATTEMPTS, backoff=RETRY_BACKOFF_SECS):
+    """Call a zero-arg callable, retrying on exception with linear backoff."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoff * (attempt + 1))
 
 # A bibcode is exactly 19 characters and contains no whitespace. VizieR's
 # origin_article field returns free text for some archive catalogues
@@ -122,7 +151,7 @@ def check_mission_coverage(coord, radius_arcsec, mission):
 def simbad_lookup(coord, radius_arcsec):
     """Return ({main_id: set(bibcodes)}, errors) pulled from SIMBAD's biblio field."""
     try:
-        result = Simbad.query_region(coord, radius=radius_arcsec * u.arcsec)
+        result = _retry(lambda: Simbad.query_region(coord, radius=radius_arcsec * u.arcsec))
     except Exception as e:
         return {}, [f"SIMBAD region query: {_fmt_exc(e)}"]
     if result is None:
@@ -140,7 +169,7 @@ def simbad_lookup(coord, radius_arcsec):
 def ned_lookup(coord, radius_arcsec, workers=8, show_progress=False):
     """Return ({name: {bibcode: (title, first_author)}}, errors) from NED's references tables."""
     try:
-        result = Ned.query_region(coord, radius=radius_arcsec * u.arcsec)
+        result = _retry(lambda: Ned.query_region(coord, radius=radius_arcsec * u.arcsec))
     except Exception as e:
         return {}, [f"NED region query: {_fmt_exc(e)}"]
     if result is None:
@@ -187,10 +216,20 @@ def vizier_lookup(coord, radius_arcsec, workers=8, show_progress=False):
     were never folded into SIMBAD or NED as catalogued objects. Sub-tables are
     collapsed to their parent catalogue before metadata is fetched.
     """
+    def new_vizier(**kwargs):
+        # Vizier(...) builds a fresh VizierClass instance each call (see the
+        # cache_location comment near the top of this file), so cache_location
+        # must be set on every instance, not just once at import time.
+        v = Vizier(**kwargs)
+        v.cache_location = VIZIER_CACHE_LOCATION
+        return v
+
     try:
         # row_limit=1: we only need to know that a catalogue covers this
         # position, never the photometry itself.
-        result = Vizier(row_limit=1).query_region(coord, radius=radius_arcsec * u.arcsec)
+        result = _retry(
+            lambda: new_vizier(row_limit=1).query_region(coord, radius=radius_arcsec * u.arcsec)
+        )
     except Exception as e:
         return {}, [f"VizieR cone search: {_fmt_exc(e)}"]
 
@@ -206,7 +245,7 @@ def vizier_lookup(coord, radius_arcsec, workers=8, show_progress=False):
     errors = []
 
     def fetch(catalog):
-        return Vizier().get_catalog_metadata(catalog=catalog)
+        return new_vizier().get_catalog_metadata(catalog=catalog)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch, cat): cat for cat in parents}
