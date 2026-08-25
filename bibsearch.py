@@ -27,6 +27,7 @@ Usage:
     bibsearch --radec 53.15398,-27.80095 --mission HST
     bibsearch --radec 53.15398,-27.80095 --simbad --ned    # skip the slow VizieR pass
     bibsearch --radec 53.15398,-27.80095 --vizier          # VizieR only
+    bibsearch --radec 53.15398,-27.80095 --savefile out.txt  # also writes out.json: raw VizieR rows (z, sep, photometry)
 
 coords.txt format (two comma-separated columns, RA,Dec in degrees, one pair per line):
     53.15398,-27.80095
@@ -35,15 +36,22 @@ coords.txt format (two comma-separated columns, RA,Dec in degrees, one pair per 
 
 import argparse
 import html
+import json
+import math
 import os
+import pickle
+import random
 import re
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from xml.parsers.expat import ExpatError
 
+import numpy as np
 from astropy.utils.exceptions import AstropyWarning
-from astroquery.exceptions import NoResultsWarning
+from astroquery.exceptions import NoResultsWarning, TableParseError
 
 warnings.simplefilter("ignore", category=NoResultsWarning)
 warnings.simplefilter("ignore", category=AstropyWarning)
@@ -85,22 +93,178 @@ Simbad.add_votable_fields("biblio")
 # connection transiently; retry a couple of times before giving up.
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECS = 5
+# +/-25% jitter on every backoff sleep. NED reference-table fetches run
+# `workers` (default 8) requests concurrently, all starting their retry
+# countdown at roughly the same moment on a shared failure (e.g. NED
+# rate-limiting the burst) -- with a fixed backoff every thread retries in
+# lockstep and re-creates the exact same burst that got them rate-limited in
+# the first place. Jitter spreads the retries out instead.
+RETRY_JITTER_FRAC = 0.25
+
+# astroquery caches every HTTP response to disk (keyed by request hash) before
+# checking its status code, and its cache reader doesn't guard against a
+# truncated file. So a transient 503 or a run killed mid-write leaves a
+# corrupt cache entry -- either empty (pickle.load raises EOFError) or a
+# cached HTML error page that the caller then tries to parse as XML/VOTable
+# (ExpatError). Once that happens, every subsequent call for that exact query
+# reads the same bad entry back and fails identically forever: retrying the
+# call alone never helps. clear_cache, when given, is invoked on exactly
+# these two error types so the retry actually re-fetches from the network.
+#
+# Vizier wraps whatever blew up while parsing the VOTable body (ExpatError
+# included) in its own TableParseError before raising, rather than letting
+# the original exception propagate -- see _is_cache_corruption below, which
+# unwraps it via __context__ (Python sets this automatically for a bare
+# `raise NewError(...)` inside an `except ... as ex:` block, even without
+# `raise ... from ex`) so this case is still recognised as corruption.
+CACHE_CORRUPTION_ERRORS = (EOFError, ExpatError, pickle.UnpicklingError)
+
+_cache_clear_lock = threading.Lock()
 
 
-def _retry(fn, attempts=RETRY_ATTEMPTS, backoff=RETRY_BACKOFF_SECS):
-    """Call a zero-arg callable, retrying on exception with linear backoff."""
+def _is_cache_corruption(e):
+    """True if `e` looks like on-disk astroquery cache corruption (see
+    CACHE_CORRUPTION_ERRORS), including when it arrives wrapped in a VizieR
+    TableParseError rather than raised directly."""
+    if isinstance(e, CACHE_CORRUPTION_ERRORS):
+        return True
+    if isinstance(e, TableParseError):
+        return isinstance(e.__context__, CACHE_CORRUPTION_ERRORS)
+    return False
+
+
+def _clear_cache_safely(clear_fn):
+    """Run a Service.clear_cache under a lock so concurrent callers (this is
+    invoked from thread pools) don't race to unlink() the same files."""
+    with _cache_clear_lock:
+        try:
+            clear_fn()
+        except FileNotFoundError:
+            pass
+
+
+def _retry(fn, attempts=RETRY_ATTEMPTS, backoff=RETRY_BACKOFF_SECS, clear_cache=None, no_retry=()):
+    """Call a zero-arg callable, retrying on exception with linear backoff.
+
+    `no_retry` is a tuple of exception types that should propagate
+    immediately without consuming an attempt (e.g. a service's "no data for
+    this object" signal, which is a normal outcome, not a fault worth
+    retrying). `clear_cache` is called before backing off whenever the
+    exception looks like on-disk cache corruption (see
+    CACHE_CORRUPTION_ERRORS above).
+    """
     for attempt in range(attempts):
         try:
             return fn()
-        except Exception:
+        except no_retry:
+            raise
+        except Exception as e:
             if attempt == attempts - 1:
                 raise
-            time.sleep(backoff * (attempt + 1))
+            if clear_cache is not None and _is_cache_corruption(e):
+                _clear_cache_safely(clear_cache)
+            delay = backoff * (attempt + 1)
+            delay *= 1 + random.uniform(-RETRY_JITTER_FRAC, RETRY_JITTER_FRAC)
+            time.sleep(delay)
 
 # A bibcode is exactly 19 characters and contains no whitespace. VizieR's
 # origin_article field returns free text for some archive catalogues
 # ("European Southern Observatory (2016)"), which this filters out.
 BIBCODE_RE = re.compile(r"^\d{4}\S{15}$")
+
+# Candidate RA/Dec column pairs used as a fallback separation calculation when
+# a VizieR table lacks the "_r" distance column (only added when explicitly
+# requested via columns=["*", "+_r"], and not every catalogue honours it).
+RADEC_COLUMN_CANDIDATES = (
+    ("_RAJ2000", "_DEJ2000"),
+    ("RAJ2000", "DEJ2000"),
+    ("RA_ICRS", "DE_ICRS"),
+    ("RAdeg", "DEdeg"),
+    ("RA", "DEC"),
+    ("ra", "dec"),
+)
+
+# Cap on rows returned per VizieR table for a single cone search. Sorted by
+# separation ascending (see the "+_r" columns request in vizier_lookup), so
+# this is "closest N sources in this catalogue", not an arbitrary truncation.
+# Search radii here are a few arcsec at most, so 50 is generous headroom for
+# a crowded field while still bounding a pathologically large --radius.
+VIZIER_MATCH_ROW_LIMIT = 50
+
+# Column names checked, in priority order, when guessing which column holds a
+# redshift. This is a heuristic over wildly inconsistent VizieR naming
+# conventions, not a guarantee -- the full raw row is always kept too so any
+# missed redshift (or photometry) column can be recovered by hand.
+REDSHIFT_COLUMN_PRIORITY = (
+    "redshift", "zspec", "zphot", "zbest",
+    "z_spec", "z_phot", "zsp", "zph", "z",
+)
+
+
+def _to_native(val):
+    """Convert one astropy/numpy table cell to a JSON-serialisable Python value."""
+    if val is np.ma.masked:
+        return None
+    if isinstance(val, (bytes, np.bytes_)):
+        return val.decode("utf-8", "replace")
+    if isinstance(val, np.generic):
+        val = val.item()
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    return val
+
+
+def _parent_catalog(name):
+    """Collapse a VizieR sub-table name to its parent catalogue (shared bibcode)."""
+    return "/".join(name.split("/")[:-1]) if name.count("/") > 1 else name
+
+
+def _extract_separation_arcsec(row, table, coord):
+    """Return the on-sky separation (arcsec) between `coord` and this matched row."""
+    if "_r" in table.colnames:
+        native = _to_native(row["_r"])
+        if native is not None:
+            # VizieR's ASU convention is arcmin, but the CDS service actually
+            # returns "_r" in arcsec without populating column.unit (checked
+            # empirically: with radius=1", every returned "_r" was <= 1 only
+            # when read as arcsec -- reading as arcmin put values 60x over
+            # the search radius). Trust the metadata if it's ever populated;
+            # arcsec is the correct fallback, not arcmin.
+            unit = table["_r"].unit or u.arcsec
+            try:
+                return float((native * unit).to(u.arcsec).value)
+            except Exception:
+                pass
+    for ra_col, dec_col in RADEC_COLUMN_CANDIDATES:
+        if ra_col not in table.colnames or dec_col not in table.colnames:
+            continue
+        ra_val = _to_native(row[ra_col])
+        dec_val = _to_native(row[dec_col])
+        if ra_val is None or dec_val is None:
+            continue
+        try:
+            ra_unit = table[ra_col].unit or u.deg
+            dec_unit = table[dec_col].unit or u.deg
+            match_coord = SkyCoord(ra=ra_val * ra_unit, dec=dec_val * dec_unit, frame="icrs")
+            return float(coord.separation(match_coord).arcsec)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_redshift(row, table):
+    """Return (value, column_name) for the first column matching a known redshift name."""
+    lower_map = {}
+    for c in table.colnames:
+        lower_map.setdefault(c.lower(), c)
+    for candidate in REDSHIFT_COLUMN_PRIORITY:
+        col = lower_map.get(candidate)
+        if col is None:
+            continue
+        val = _to_native(row[col])
+        if val is not None:
+            return val, col
+    return None, None
 
 # Order in which provenance tags are displayed.
 _TAG_ORDER = "SNVA"
@@ -151,7 +315,10 @@ def check_mission_coverage(coord, radius_arcsec, mission):
 def simbad_lookup(coord, radius_arcsec):
     """Return ({main_id: set(bibcodes)}, errors) pulled from SIMBAD's biblio field."""
     try:
-        result = _retry(lambda: Simbad.query_region(coord, radius=radius_arcsec * u.arcsec))
+        result = _retry(
+            lambda: Simbad.query_region(coord, radius=radius_arcsec * u.arcsec),
+            clear_cache=Simbad.clear_cache,
+        )
     except Exception as e:
         return {}, [f"SIMBAD region query: {_fmt_exc(e)}"]
     if result is None:
@@ -169,7 +336,10 @@ def simbad_lookup(coord, radius_arcsec):
 def ned_lookup(coord, radius_arcsec, workers=8, show_progress=False):
     """Return ({name: {bibcode: (title, first_author)}}, errors) from NED's references tables."""
     try:
-        result = _retry(lambda: Ned.query_region(coord, radius=radius_arcsec * u.arcsec))
+        result = _retry(
+            lambda: Ned.query_region(coord, radius=radius_arcsec * u.arcsec),
+            clear_cache=Ned.clear_cache,
+        )
     except Exception as e:
         return {}, [f"NED region query: {_fmt_exc(e)}"]
     if result is None:
@@ -180,7 +350,11 @@ def ned_lookup(coord, radius_arcsec, workers=8, show_progress=False):
     errors = []
 
     def fetch(name):
-        return Ned.get_table(name, table="references")
+        return _retry(
+            lambda: Ned.get_table(name, table="references"),
+            clear_cache=Ned.clear_cache,
+            no_retry=(RemoteServiceError,),
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch, name): name for name in names}
@@ -210,11 +384,22 @@ def ned_lookup(coord, radius_arcsec, workers=8, show_progress=False):
 
 
 def vizier_lookup(coord, radius_arcsec, workers=8, show_progress=False):
-    """Return ({bibcode: (title, first_author)}, errors) for VizieR catalogues covering the position.
+    """Return ({bibcode: (title, first_author)}, raw_matches, errors) for VizieR
+    catalogues covering the position.
 
     VizieR indexes published tables directly, so it reaches papers whose sources
     were never folded into SIMBAD or NED as catalogued objects. Sub-tables are
     collapsed to their parent catalogue before metadata is fetched.
+
+    `raw_matches` is a list of one record per matched *source* -- separation,
+    a best-effort redshift, and the full raw row (all columns, with units) --
+    for every source, in every sub-table, whose parent catalogue resolved to a
+    valid bibcode. A catalogue can have more than one source within the search
+    radius (crowded fields, blends); all of them are returned, sorted nearest
+    first, up to VIZIER_MATCH_ROW_LIMIT per table -- none are silently dropped
+    for having a farther neighbour take the "first row". This is the actual
+    catalogue data (redshifts, photometry, ...) behind each "successfully
+    cross-matched" paper, not just its metadata.
     """
     def new_vizier(**kwargs):
         # Vizier(...) builds a fresh VizierClass instance each call (see the
@@ -225,27 +410,32 @@ def vizier_lookup(coord, radius_arcsec, workers=8, show_progress=False):
         return v
 
     try:
-        # row_limit=1: we only need to know that a catalogue covers this
-        # position, never the photometry itself.
+        # "+_r" (not just "_r") requests both the separation column *and*
+        # sorting by it ascending -- a leading +/- on a VizieR column name is
+        # a sort request, so row N is always the N-th closest source.
         result = _retry(
-            lambda: new_vizier(row_limit=1).query_region(coord, radius=radius_arcsec * u.arcsec)
+            lambda: new_vizier(row_limit=VIZIER_MATCH_ROW_LIMIT, columns=["*", "+_r"]).query_region(
+                coord, radius=radius_arcsec * u.arcsec
+            ),
+            clear_cache=lambda: new_vizier().clear_cache(),
         )
     except Exception as e:
-        return {}, [f"VizieR cone search: {_fmt_exc(e)}"]
+        return {}, [], [f"VizieR cone search: {_fmt_exc(e)}"]
 
-    parents = sorted({
-        "/".join(name.split("/")[:-1]) if name.count("/") > 1 else name
-        for name in (t.meta.get("name") for t in result)
-        if name
-    })
+    tables_by_name = {t.meta.get("name"): t for t in result if t.meta.get("name")}
+    parents = sorted({_parent_catalog(name) for name in tables_by_name})
     if not parents:
-        return {}, []
+        return {}, [], []
 
     papers = {}
+    catalog_bibcode = {}  # parent catalog -> bibcode, for joining raw rows below
     errors = []
 
     def fetch(catalog):
-        return new_vizier().get_catalog_metadata(catalog=catalog)
+        return _retry(
+            lambda: new_vizier().get_catalog_metadata(catalog=catalog),
+            clear_cache=lambda: new_vizier().clear_cache(),
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fetch, cat): cat for cat in parents}
@@ -265,8 +455,38 @@ def vizier_lookup(coord, radius_arcsec, workers=8, show_progress=False):
                 continue
             title = str(row["title"]).strip() if "title" in meta.colnames else ""
             authors = str(row["authors"]) if "authors" in meta.colnames else ""
-            papers[bibcode] = (title or None, authors.split(";")[0].strip() or None)
-    return papers, errors
+            title, author = title or None, authors.split(";")[0].strip() or None
+            papers[bibcode] = (title, author)
+            catalog_bibcode[catalog] = bibcode
+
+    raw_matches = []
+    for name, table in tables_by_name.items():
+        if len(table) == 0:
+            continue
+        bibcode = catalog_bibcode.get(_parent_catalog(name))
+        if not bibcode:
+            continue
+        title, author = papers[bibcode]
+        units = {c: str(table[c].unit) for c in table.colnames if table[c].unit is not None}
+        for row_index, row in enumerate(table):
+            separation_arcsec = _extract_separation_arcsec(row, table, coord)
+            redshift, redshift_column = _extract_redshift(row, table)
+            raw_matches.append({
+                "bibcode": bibcode,
+                "title": title,
+                "author": author,
+                "vizier_table": name,
+                "parent_catalog": _parent_catalog(name),
+                "row_index": row_index,
+                "n_matches_in_table": len(table),
+                "separation_arcsec": separation_arcsec,
+                "redshift": redshift,
+                "redshift_column": redshift_column,
+                "columns": {c: _to_native(row[c]) for c in table.colnames},
+                "units": units,
+            })
+
+    return papers, raw_matches, errors
 
 
 def find_papers_for_object(name, rows=50):
@@ -311,10 +531,12 @@ def check_object_in_literature(
     workers=8,
     show_progress=False,
 ):
-    """Return a formatted report string for one RA/Dec pair.
+    """Return (report_string, vizier_raw_matches) for one RA/Dec pair.
 
     `services` is the set of bibliography services to query; it defaults to all
-    of them (see DEFAULT_SERVICES).
+    of them (see DEFAULT_SERVICES). `vizier_raw_matches` is the raw per-row
+    VizieR data described in `vizier_lookup` -- empty unless "vizier" is
+    selected.
     """
     services = DEFAULT_SERVICES if services is None else frozenset(services)
     used = "+".join(SERVICE_LABELS[s] for s in SERVICE_ORDER if s in services) or "none"
@@ -348,8 +570,9 @@ def check_object_in_literature(
         errors += ned_errors
 
     vizier_papers = {}
+    vizier_raw = []
     if "vizier" in services:
-        vizier_papers, vizier_errors = vizier_lookup(coord, radius_arcsec, workers, show_progress)
+        vizier_papers, vizier_raw, vizier_errors = vizier_lookup(coord, radius_arcsec, workers, show_progress)
         errors += vizier_errors
 
     names = set(simbad_hits) | set(ned_hits) | target_names
@@ -412,12 +635,31 @@ def check_object_in_literature(
         summary += "  -- INCOMPLETE, see query failures below"
     lines.append(summary)
 
+    raw_by_bibcode = {}
+    for entry in vizier_raw:
+        raw_by_bibcode.setdefault(entry["bibcode"], []).append(entry)
+
     for bibcode, v in sorted(papers.items(), key=lambda kv: kv[0][:4], reverse=True):
         year = bibcode[:4] if bibcode[:4].isdigit() else "----"
         tags = "".join(t for t in _TAG_ORDER if t in v["sources"])
         title = v["title"] or "(title unavailable)"
         author = v["author"] or "(author unavailable)"
         lines.append(f"    {year}  [{tags:<4}]  {bibcode}  {title}  {author}")
+        for entry in raw_by_bibcode.get(bibcode, []):
+            sep = entry["separation_arcsec"]
+            sep_str = f'{sep:.2f}"' if sep is not None else "n/a"
+            if entry["redshift"] is not None:
+                z_str = f'{entry["redshift"]} ({entry["redshift_column"]})'
+            else:
+                z_str = "n/a"
+            n_cols = len(entry["columns"])
+            table_tag = f"{entry['vizier_table']}"
+            if entry["n_matches_in_table"] > 1:
+                table_tag += f" {entry['row_index'] + 1}/{entry['n_matches_in_table']}"
+            lines.append(
+                f"          [{table_tag}]  sep={sep_str}  z={z_str}"
+                f"  ({n_cols} column{'s' if n_cols != 1 else ''} -- see --savefile for photometry)"
+            )
 
     if errors:
         lines.append("")
@@ -425,7 +667,7 @@ def check_object_in_literature(
         for err in errors:
             lines.append(f"       {err}")
 
-    return "\n".join(lines)
+    return "\n".join(lines), vizier_raw
 
 
 def parse_coord_list(radec_arg):
@@ -507,7 +749,11 @@ def main():
     parser.add_argument(
         "--savefile",
         default=None,
-        help="Path to save output. By default output is only printed, not saved.",
+        help="Path to save output. By default output is only printed, not saved. "
+        "Also writes the raw per-match VizieR data (bibcode, separation, "
+        "best-effort redshift, and every raw column with units, so photometry "
+        "can be extracted later) as JSON alongside it, at the same path with "
+        "its extension replaced by .json.",
     )
     args = parser.parse_args()
 
@@ -537,21 +783,34 @@ def main():
                     file=sys.stderr,
                 )
 
+    if args.savefile and "vizier" not in selected:
+        print(
+            "warning: VizieR is not among the selected services, so the raw "
+            "match data JSON will be written with empty 'matches' lists.",
+            file=sys.stderr,
+        )
+
     reports = []
+    raw_positions = []
     for i, (ra, dec) in enumerate(coords, 1):
         if show_progress and len(coords) > 1:
             print(f"[{i}/{len(coords)}] RA={ra:.6f} Dec={dec:.6f}", file=sys.stderr, flush=True)
-        reports.append(
-            check_object_in_literature(
-                ra,
-                dec,
-                args.radius,
-                args.mission,
-                services=selected,
-                workers=args.workers,
-                show_progress=show_progress,
-            )
+        report, vizier_raw = check_object_in_literature(
+            ra,
+            dec,
+            args.radius,
+            args.mission,
+            services=selected,
+            workers=args.workers,
+            show_progress=show_progress,
         )
+        reports.append(report)
+        raw_positions.append({
+            "ra_deg": ra,
+            "dec_deg": dec,
+            "radius_arcsec": args.radius,
+            "matches": vizier_raw,
+        })
     output = ("\n\n" + "-" * 40 + "\n\n").join(reports)
 
     print(output)
@@ -563,6 +822,13 @@ def main():
             f.write(output + "\n")
 
         print(f"\nSaved to: {savefile}")
+
+        rawfile = os.path.splitext(savefile)[0] + ".json"
+        with open(rawfile, "w") as f:
+            json.dump(raw_positions, f, indent=2)
+
+        n_rows = sum(len(p["matches"]) for p in raw_positions)
+        print(f"Raw VizieR data saved to: {rawfile} ({n_rows} row(s) across {len(raw_positions)} position(s))")
 
 
 if __name__ == "__main__":
