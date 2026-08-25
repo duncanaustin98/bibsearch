@@ -86,6 +86,10 @@ bibsearch --radec 189.106043,62.242045 --vizier
 
 # Many positions from a file
 bibsearch --radec coords.txt
+
+# --savefile out.txt also writes out.json: raw VizieR match data (redshift,
+# separation, full columns for photometry)
+bibsearch --radec 189.106043,62.242045 --savefile out.txt
 ```
 
 `coords.txt` takes one comma-separated `RA,Dec` pair per line, in degrees.
@@ -107,11 +111,88 @@ Blank lines and lines starting with `#` are ignored:
 | `--simbad` `--ned` `--vizier` | all on | Restrict to the named services (see below) |
 | `--workers` | `8` | Threads for NED reference and VizieR metadata lookups |
 | `--no-progress` | off | Suppress progress bars |
-| `--savefile` | *(none)* | Write the report to this path as well as stdout |
-
+| `--savefile` | *(none)* | Write the report to this path as well as stdout, and raw per-match VizieR data (see below) to the same path with `.json` in place of its extension |
 
 Some VizieR archive catalogues (`B/eso`, `B/hst`) return free text such as
 `"European Southern Observatory (2016)"` in place of a bibcode; these are observation logs rather than papers and are filtered out.
+
+### Raw match data
+
+When VizieR is one of the selected services, every VizieR-sourced paper in the
+report gets an extra indented line per matched *source*, showing the
+separation and a best-effort redshift straight from that catalogue's own row
+-- the same data VizieR indexed to find the position in the first place:
+
+```
+    2024  [V   ]  2024A&A...691A.240M  ASTRODEEP-JWST photometry and redshifts  Merlin E.
+          [J/A+A/691/A240/catalog]  sep=0.14"  z=10.97 (zphot)  (86 columns -- see --savefile for photometry)
+```
+
+If a catalogue has more than one source within the search radius (a crowded
+field, a blend), all of them are shown -- nearest first -- not just the
+closest, and each line is tagged `N/M`:
+
+```
+    2013  [V   ]  2013ApJ...779...25X  Fake Title  Author, A.
+          [J/ApJ/779/25/table1 1/2]  sep=0.50"  z=9.234 (zphot)  (5 columns -- see --savefile for photometry)
+          [J/ApJ/779/25/table1 2/2]  sep=1.90"  z=3.1 (zphot)  (5 columns -- see --savefile for photometry)
+```
+
+Up to `VIZIER_MATCH_ROW_LIMIT` (50) sources per table are captured this way;
+none are silently dropped just for having a farther neighbour returned first.
+
+This is skipped by SIMBAD and NED: they resolve to an *object*, with at most
+one position/redshift for that object, not a row from each paper's own table,
+so there is nothing paper-specific to extract from them.
+
+The redshift printed inline is a best-effort guess (see below), and the row's
+other columns -- photometry included -- aren't dumped inline since a table can
+have anywhere from a handful to 100+ columns. Pass `--savefile` to get every
+column, with units, as JSON alongside the text report (e.g. `--savefile
+out.txt` also writes `out.json`).
+
+The JSON file is a list, one entry per input position:
+
+```json
+[
+  {
+    "ra_deg": 189.106043,
+    "dec_deg": 62.242045,
+    "radius_arcsec": 0.5,
+    "matches": [
+      {
+        "bibcode": "2024A&A...691A.240M",
+        "title": "ASTRODEEP-JWST photometry and redshifts",
+        "author": "Merlin E.",
+        "vizier_table": "J/A+A/691/A240/catalog",
+        "parent_catalog": "J/A+A/691/A240",
+        "row_index": 0,
+        "n_matches_in_table": 1,
+        "separation_arcsec": 0.14,
+        "redshift": 10.97,
+        "redshift_column": "zphot",
+        "columns": { "...": "every raw column from the matched row" },
+        "units": { "Jmag": "mag", "...": "..." }
+      }
+    ]
+  }
+]
+```
+
+`row_index`/`n_matches_in_table` distinguish multiple sources from the same
+catalogue table within the search radius: `row_index` is 0-based, ordered by
+increasing separation, and `n_matches_in_table` is the total count for that
+table at this position (2 for the pair above).
+
+`redshift`/`redshift_column` are a best-effort guess over a priority list of
+common column names (`redshift`, `zspec`, `zphot`, `zbest`, `z`, ...) --
+VizieR naming is not standardised, so always check `columns` for the actual
+value if the guess looks wrong or comes back `null`. `columns` holds every
+raw column from the matched row (photometry included, whatever that catalogue
+publishes) with `units` giving the unit for any column that has one, so
+photometry can be pulled out programmatically without re-querying VizieR.
+`separation_arcsec` comes from VizieR's own distance-from-center column,
+falling back to a manual RA/Dec computation if a catalogue doesn't provide it.
 
 ### Failed queries are reported, never silent
 
